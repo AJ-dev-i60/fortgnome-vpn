@@ -138,13 +138,16 @@ class StatusWindow(Gtk.Window):
         self.app = app
         try: self.set_icon_from_file(LOGO)
         except Exception: pass
-        self.set_default_size(320, 320); self.set_resizable(False)
+        self.set_default_size(340, 300); self.set_resizable(False)
         self.set_position(Gtk.WindowPosition.CENTER)
-        self.connect("delete-event", lambda *_: (self.hide(), True)[1])
+        # destroy on close (don't hide) so reopening always works cleanly
+        self.connect("destroy", lambda *_: setattr(self.app, "win", None))
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         for m in ("top", "bottom", "start", "end"): getattr(box, "set_margin_"+m)(18)
         self.img = Gtk.Image(); box.pack_start(self.img, False, False, 0)
-        self.lbl = Gtk.Label(); box.pack_start(self.lbl, False, False, 0)
+        self.lbl = Gtk.Label(); self.lbl.set_line_wrap(True)
+        self.lbl.set_justify(Gtk.Justification.CENTER)
+        box.pack_start(self.lbl, False, False, 0)
         self.btn = Gtk.Button(); self.btn.set_size_request(-1, 44)
         self.btn.connect("clicked", self.app.on_toggle)
         box.pack_start(self.btn, False, False, 0)
@@ -153,99 +156,23 @@ class StatusWindow(Gtk.Window):
         box.pack_start(setb, False, False, 0)
         self.add(box)
 
-    def update(self, up, busy):
-        ico = "fortgnome-wait" if busy else ("fortgnome-on" if up else "fortgnome-off")
+    def render(self, icon, line_markup, btn_label, btn_sensitive):
         self.img.set_from_pixbuf(GdkPixbuf.Pixbuf.new_from_file_at_size(
-            os.path.join(ICONS, ico + ".png"), 96, 96))
-        if busy:
-            self.lbl.set_markup("<b>Working…</b>"); self.btn.set_sensitive(False); return
-        self.btn.set_sensitive(True)
-        if up:
-            sub = load_config().get("remote_subnet", "")
-            self.lbl.set_markup('<b><span foreground="#1a8a1a">Connected</span></b>'
-                                + (f'\n<small>{GLib.markup_escape_text(sub)} reachable</small>' if sub else ""))
-            self.btn.set_label("Disconnect")
-        else:
-            self.lbl.set_markup('<b><span foreground="#888">Disconnected</span></b>')
-            self.btn.set_label("Connect")
-
-
-class ProgressWindow(Gtk.Window):
-    STEPS = [
-        ("contact", "Contacting VPN gateway"),
-        ("auth",    "Authenticating (username & password)"),
-        ("netcfg",  "Getting network configuration"),
-        ("tunnel",  "Establishing encrypted tunnel"),
-    ]
-    MARK = {"pending": ("○", "#888888"), "active": ("➤", "#1976d2"),
-            "done": ("✓", "#1a8a1a"), "fail": ("✗", "#c0271a")}
-
-    def __init__(self, app):
-        super().__init__(title="Connecting — FortGNOME VPN")
-        self.app = app
-        try: self.set_icon_from_file(LOGO)
-        except Exception: pass
-        self.set_default_size(380, -1); self.set_resizable(False)
-        self.set_position(Gtk.WindowPosition.CENTER)
-        self.connect("delete-event", lambda *_: (self.hide(), True)[1])
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        for m in ("top", "bottom", "start", "end"): getattr(box, "set_margin_"+m)(18)
-        head = Gtk.Box(spacing=8)
-        self.spinner = Gtk.Spinner(); self.spinner.start()
-        head.pack_start(self.spinner, False, False, 0)
-        self.title = Gtk.Label(xalign=0); self.title.set_markup("<b>Connecting…</b>")
-        head.pack_start(self.title, True, True, 0)
-        box.pack_start(head, False, False, 0)
-        self.rows = {}
-        for key, text in self.STEPS:
-            row = Gtk.Box(spacing=8)
-            ic = Gtk.Label(); tx = Gtk.Label(label=text, xalign=0)
-            row.pack_start(ic, False, False, 0); row.pack_start(tx, True, True, 0)
-            box.pack_start(row, False, False, 0)
-            self.rows[key] = (ic, tx, text)
-            self._mark(key, "pending")
-        self.detail = Gtk.Label(xalign=0); self.detail.set_line_wrap(True)
-        self.detail.get_style_context().add_class("dim-label")
-        box.pack_start(self.detail, False, False, 0)
-        self.btn = Gtk.Button(label="Close")
-        self.btn.connect("clicked", lambda *_: self.destroy())
-        self.btn.set_no_show_all(True)
-        box.pack_start(self.btn, False, False, 0)
-        self.add(box); self.show_all()
-
-    def _mark(self, key, state, note=None):
-        ic, tx, text = self.rows[key]
-        ch, col = self.MARK[state]
-        ic.set_markup('<span foreground="%s" weight="bold">%s</span>' % (col, ch))
-        label = text + ("  —  " + note if note else "")
-        if state == "fail":
-            tx.set_markup('<span foreground="%s">%s</span>' % (col, GLib.markup_escape_text(label)))
-        else:
-            tx.set_text(label)
-
-    def set_step(self, key, state, note=None):
-        self._mark(key, state, note); return False
-
-    def finish_ok(self):
-        self.spinner.stop()
-        self.title.set_markup('<b><span foreground="#1a8a1a">Connected ✓</span></b>')
-        self.app._connect_finished(True)
-        GLib.timeout_add_seconds(2, lambda: (self.destroy(), False)[1])
-        return False
-
-    def finish_fail(self, key, reason):
-        self.spinner.stop()
-        self.title.set_markup('<b><span foreground="#c0271a">Connection failed</span></b>')
-        self._mark(key, "fail")
-        self.detail.set_markup('<span foreground="#c0271a">%s</span>' % GLib.markup_escape_text(reason))
-        self.btn.show()
-        self.app._connect_finished(False)
-        return False
+            os.path.join(ICONS, icon + ".png"), 96, 96))
+        self.lbl.set_markup(line_markup)
+        self.btn.set_label(btn_label); self.btn.set_sensitive(btn_sensitive)
 
 
 class FortGnome:
+    # the single-line progress steps shown with an N/5 counter while connecting
+    STEPS = ["Starting VPN service", "Contacting VPN gateway", "Authenticating",
+             "Getting network configuration", "Establishing encrypted tunnel"]
+
     def __init__(self):
-        self.busy = False; self.win = None
+        self.busy = False
+        self.win = None
+        self.progress = None   # current step line while connecting
+        self.failed = None     # last failure message (shown until next action)
         self.ind = AppIndicator.Indicator.new_with_path(
             APP_ID, "fortgnome-off", AppIndicator.IndicatorCategory.SYSTEM_SERVICES, ICONS)
         self.ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
@@ -260,23 +187,56 @@ class FortGnome:
                   Gtk.SeparatorMenuItem(), mi_quit):
             m.append(w)
         m.show_all(); self.ind.set_menu(m)
-        self.refresh()
+        self._apply()
         GLib.timeout_add_seconds(5, self._tick)
         if not have_config():
             GLib.timeout_add(400, lambda: (self.open_settings(), False)[1])
 
-    def set_state(self, up):
-        if self.busy: return
-        self.ind.set_icon_full("fortgnome-on" if up else "fortgnome-off",
-                               "FortGNOME VPN connected" if up else "FortGNOME VPN disconnected")
-        self.mi_status.set_label("● Connected" if up else "○ Disconnected")
-        self.mi_toggle.set_label("Disconnect" if up else "Connect")
-        if self.win: self.win.update(up, False)
+    # ---- one place that renders state into both the tray menu and the window ----
+    def _apply(self):
+        if self.busy:
+            icon = "fortgnome-wait"
+            menu = self.progress or "Working…"
+            line = "<b>%s</b>" % GLib.markup_escape_text(menu)
+            btn, sens, tgl = "…", False, "Connect"
+        else:
+            up = vpn_is_up()
+            if up:
+                self.failed = None
+                icon, menu = "fortgnome-on", "● Connected"
+                sub = load_config().get("remote_subnet", "")
+                line = ('<b><span foreground="#1a8a1a">Connected</span></b>'
+                        + (f'\n<small>{GLib.markup_escape_text(sub)} reachable</small>' if sub else ""))
+                btn, sens, tgl = "Disconnect", True, "Disconnect"
+            elif self.failed:
+                icon, menu = "fortgnome-off", "✗ Failed"
+                line = ('<b><span foreground="#c0271a">Failed</span></b>'
+                        + '\n<small>%s</small>' % GLib.markup_escape_text(self.failed))
+                btn, sens, tgl = "Connect", True, "Connect"
+            else:
+                icon, menu = "fortgnome-off", "○ Disconnected"
+                line = '<b><span foreground="#888888">Disconnected</span></b>'
+                btn, sens, tgl = "Connect", True, "Connect"
+        self.ind.set_icon_full(icon, menu)
+        self.mi_status.set_label(menu)
+        self.mi_toggle.set_label(tgl)
+        if self.win: self.win.render(icon, line, btn, sens)
 
-    def refresh(self): self.set_state(vpn_is_up())
+    def refresh(self): self._apply()
     def _tick(self):
-        if not self.busy: self.refresh()
+        if not self.busy: self._apply()
         return True
+
+    def _set_progress(self, text):
+        self.progress = text; self._apply(); return False
+
+    def _result(self, ok, msg):
+        self.busy = False; self.progress = None
+        self.failed = None if ok else msg
+        self._apply(); return False
+
+    def _stepline(self, i, extra=""):
+        return "%s… (%d/%d)%s" % (self.STEPS[i], i + 1, len(self.STEPS), extra)
 
     def on_toggle(self, *_):
         if self.busy: return
@@ -286,27 +246,21 @@ class FortGnome:
         else:           self._connect()
 
     def _connect(self):
-        self.busy = True
-        self.ind.set_icon_full("fortgnome-wait", "FortGNOME VPN connecting")
-        self.mi_status.set_label("Connecting…")
-        if self.win: self.win.update(True, True)
-        prog = ProgressWindow(self)
-        threading.Thread(target=self._connect_worker, args=(prog,), daemon=True).start()
+        self.busy = True; self.failed = None
+        self.progress = self._stepline(0)
+        self._apply()
+        threading.Thread(target=self._connect_worker, daemon=True).start()
 
     def _disconnect(self):
-        self.busy = True
-        self.ind.set_icon_full("fortgnome-wait", "FortGNOME VPN working")
-        self.mi_status.set_label("Disconnecting…")
-        if self.win: self.win.update(False, True)
+        self.busy = True; self.failed = None
+        self.progress = "Disconnecting…"
+        self._apply()
         def w():
             subprocess.run([HELPER, "down"], capture_output=True)
-            GLib.idle_add(self._connect_finished, False)
+            GLib.idle_add(self._result, False, None)
         threading.Thread(target=w, daemon=True).start()
 
-    def _connect_finished(self, success):
-        self.busy = False; self.refresh(); return False
-
-    def _connect_worker(self, prog):
+    def _connect_worker(self):
         # make sure the daemon is up first
         if subprocess.run(["pgrep", "-x", "charon"], capture_output=True).returncode != 0:
             subprocess.run(["sudo", "-n", "ipsec", "start"], capture_output=True)
@@ -314,62 +268,56 @@ class FortGnome:
                 if subprocess.run(["sudo", "-n", "ipsec", "status"], capture_output=True).returncode == 0:
                     break
                 time.sleep(0.3)
-        GLib.idle_add(prog.set_step, "contact", "active")
+        GLib.idle_add(self._set_progress, self._stepline(1))   # contacting gateway
         done, fail = set(), None
         try:
             proc = subprocess.Popen(["sudo", "-n", "ipsec", "up", "fortgnome"],
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, bufsize=1)
         except Exception as e:
-            GLib.idle_add(prog.finish_fail, "contact", str(e)); return
+            GLib.idle_add(self._result, False, str(e)); return
         for line in proc.stdout:
             l = line.strip()
             if "IKE_SA" in l and "established between" in l and "contact" not in done:
-                done.add("contact")
-                GLib.idle_add(prog.set_step, "contact", "done")
-                GLib.idle_add(prog.set_step, "auth", "active")
+                done.add("contact"); GLib.idle_add(self._set_progress, self._stepline(2))
             elif "XAuth authentication" in l and "successful" in l and "auth" not in done:
-                done.add("auth")
-                GLib.idle_add(prog.set_step, "auth", "done")
-                GLib.idle_add(prog.set_step, "netcfg", "active")
+                done.add("auth"); GLib.idle_add(self._set_progress, self._stepline(3))
             elif "installing new virtual IP" in l and "netcfg" not in done:
-                done.add("netcfg")
-                GLib.idle_add(prog.set_step, "netcfg", "done", l.split()[-1])
-                GLib.idle_add(prog.set_step, "tunnel", "active")
+                done.add("netcfg"); GLib.idle_add(self._set_progress, self._stepline(4, "  " + l.split()[-1]))
             elif ("established successfully" in l or ("CHILD_SA" in l and "established with" in l)) and "tunnel" not in done:
                 done.add("tunnel")
-                GLib.idle_add(prog.set_step, "tunnel", "done")
             if "giving up after" in l and not fail:
-                fail = ("contact", "No reply from the VPN gateway. Check your internet "
-                        "connection and server address, and that this network allows VPN "
-                        "(UDP ports 500/4500 — some Wi-Fi/hotspots block them).")
+                fail = ("No reply from the VPN gateway. Check your internet connection "
+                        "and server address, and that this network allows VPN "
+                        "(UDP 500/4500 — some Wi-Fi/hotspots block them).")
             elif "NO_PROPOSAL_CHOSEN" in l and not fail:
-                fail = ("tunnel" if ("auth" in done or "netcfg" in done) else "contact",
-                        "The gateway rejected the connection settings (encryption or "
+                fail = ("The gateway rejected the connection settings (encryption or "
                         "destination network). Check the destination CIDR in Settings.")
         proc.wait(); time.sleep(0.5)
         up = subprocess.run(["ip", "route", "show", "table", "220"],
                             capture_output=True, text=True).stdout.strip() != ""
         if up and "tunnel" in done:
-            GLib.idle_add(prog.finish_ok)
+            GLib.idle_add(self._result, True, None)
         else:
             if not fail:
                 if "contact" not in done:
-                    fail = ("contact", "Couldn't reach the VPN gateway — check your network and the server address.")
+                    fail = "Couldn't reach the VPN gateway — check your network and the server address."
                 elif "auth" not in done:
-                    fail = ("auth", "Login rejected — check your username and password.")
+                    fail = "Login rejected — check your username and password."
                 elif "netcfg" not in done:
-                    fail = ("netcfg", "The gateway didn't assign a network configuration.")
+                    fail = "The gateway didn't assign a network configuration."
                 else:
-                    fail = ("tunnel", "Couldn't establish the encrypted tunnel.")
-            GLib.idle_add(prog.finish_fail, fail[0], fail[1])
+                    fail = "Couldn't establish the encrypted tunnel."
+            GLib.idle_add(self._result, False, fail)
 
     def open_settings(self):
         SettingsDialog(self.win, on_saved=self.refresh)  # shows itself; response-driven
 
     def show_window(self):
-        if not self.win: self.win = StatusWindow(self)
-        self.win.show_all(); self.win.present(); self.win.update(vpn_is_up(), self.busy)
+        if self.win is None:
+            self.win = StatusWindow(self)
+        self.win.show_all(); self.win.present()
+        self._apply()
 
 
 if __name__ == "__main__":
