@@ -295,6 +295,7 @@ class FortGnome:
     def _connect(self):
         self.busy = True; self.mode = "connecting"
         self.failed = None; self._cancelled = False; self._abort = None; self._proc = None
+        self._shown = 0; self._vip = ""
         self.progress = self._stepline(0)
         self._timeout_id = GLib.timeout_add_seconds(CONNECT_TIMEOUT, self._on_timeout)
         self._apply()
@@ -322,7 +323,19 @@ class FortGnome:
             except Exception: pass
 
     def _connect_worker(self):
+        DWELL = 0.45   # UI-only: minimum time each step is shown so they don't blur past
         done, fail = set(), None
+
+        def advance_to(target):
+            # reveal steps in order with a brief dwell (display only — the real
+            # negotiation has usually already moved further ahead)
+            while self._shown < target and not self._cancelled:
+                self._shown += 1
+                extra = ("  " + self._vip) if (self._shown == 4 and self._vip) else ""
+                GLib.idle_add(self._set_progress, self._stepline(self._shown, extra))
+                time.sleep(DWELL)
+
+        time.sleep(DWELL)   # let "Starting VPN service… (1/5)" be seen
         # make sure the daemon is up first
         if subprocess.run(["pgrep", "-x", "charon"], capture_output=True).returncode != 0:
             subprocess.run(["sudo", "-n", "ipsec", "start"], capture_output=True)
@@ -332,7 +345,7 @@ class FortGnome:
                     break
                 time.sleep(0.3)
         if not self._cancelled:
-            GLib.idle_add(self._set_progress, self._stepline(1))   # contacting gateway
+            advance_to(1)   # Contacting VPN gateway (2/5)
             try:
                 proc = subprocess.Popen(["sudo", "-n", "ipsec", "up", "fortgnome"],
                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -343,11 +356,11 @@ class FortGnome:
                         break
                     l = line.strip()
                     if "IKE_SA" in l and "established between" in l and "contact" not in done:
-                        done.add("contact"); GLib.idle_add(self._set_progress, self._stepline(2))
+                        done.add("contact"); advance_to(2)      # Authenticating (3/5)
                     elif "XAuth authentication" in l and "successful" in l and "auth" not in done:
-                        done.add("auth"); GLib.idle_add(self._set_progress, self._stepline(3))
+                        done.add("auth"); advance_to(3)          # Getting network config (4/5)
                     elif "installing new virtual IP" in l and "netcfg" not in done:
-                        done.add("netcfg"); GLib.idle_add(self._set_progress, self._stepline(4, "  " + l.split()[-1]))
+                        done.add("netcfg"); self._vip = l.split()[-1]; advance_to(4)   # tunnel (5/5)
                     elif ("established successfully" in l or ("CHILD_SA" in l and "established with" in l)) and "tunnel" not in done:
                         done.add("tunnel")
                     if "giving up after" in l and not fail:
@@ -357,7 +370,7 @@ class FortGnome:
                     elif "NO_PROPOSAL_CHOSEN" in l and not fail:
                         fail = ("The gateway rejected the connection settings (encryption or "
                                 "destination network). Check the destination CIDR in Settings.")
-                proc.wait(); time.sleep(0.4)
+                proc.wait()
             except Exception as e:
                 GLib.idle_add(self._result, False, str(e)); return
         # ---- decide the outcome ----
@@ -369,6 +382,7 @@ class FortGnome:
         up = subprocess.run(["ip", "route", "show", "table", "220"],
                             capture_output=True, text=True).stdout.strip() != ""
         if up and "tunnel" in done:
+            advance_to(4); time.sleep(DWELL)   # make sure 5/5 shows before "Connected"
             GLib.idle_add(self._result, True, None)
         else:
             if not fail:

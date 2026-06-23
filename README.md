@@ -17,7 +17,7 @@ Download the latest `.deb` from the
 double-click it (opens in your software installer) **or**:
 
 ```bash
-sudo apt install ./fortgnome-vpn_1.0_all.deb
+sudo apt install ./fortgnome-vpn_1.0.5_all.deb
 ```
 
 `apt` pulls in strongSwan and all GUI dependencies automatically.
@@ -52,7 +52,7 @@ An admin can pre-fill the **non-secret** shared values (`server`,
 username/password, then rebuild:
 
 ```bash
-packaging/build-deb.sh 1.0
+packaging/build-deb.sh 1.0.5
 ```
 
 > ⚠️ Do **not** commit a real PSK or credentials to a public repository. Leave
