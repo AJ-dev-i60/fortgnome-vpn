@@ -6,7 +6,7 @@ per-user in ~/.config/fortgnome/config.ini and applied to strongSwan via the
 privileged helper `fortgnome-apply` (run through sudo). First run with no config
 opens the Settings dialog automatically.
 """
-import os, configparser, subprocess, threading, gi
+import os, configparser, subprocess, threading, time, gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
 from gi.repository import Gtk, GLib, GdkPixbuf, AyatanaAppIndicator3 as AppIndicator
@@ -170,6 +170,79 @@ class StatusWindow(Gtk.Window):
             self.btn.set_label("Connect")
 
 
+class ProgressWindow(Gtk.Window):
+    STEPS = [
+        ("contact", "Contacting VPN gateway"),
+        ("auth",    "Authenticating (username & password)"),
+        ("netcfg",  "Getting network configuration"),
+        ("tunnel",  "Establishing encrypted tunnel"),
+    ]
+    MARK = {"pending": ("○", "#888888"), "active": ("➤", "#1976d2"),
+            "done": ("✓", "#1a8a1a"), "fail": ("✗", "#c0271a")}
+
+    def __init__(self, app):
+        super().__init__(title="Connecting — FortGNOME VPN")
+        self.app = app
+        try: self.set_icon_from_file(LOGO)
+        except Exception: pass
+        self.set_default_size(380, -1); self.set_resizable(False)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.connect("delete-event", lambda *_: (self.hide(), True)[1])
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        for m in ("top", "bottom", "start", "end"): getattr(box, "set_margin_"+m)(18)
+        head = Gtk.Box(spacing=8)
+        self.spinner = Gtk.Spinner(); self.spinner.start()
+        head.pack_start(self.spinner, False, False, 0)
+        self.title = Gtk.Label(xalign=0); self.title.set_markup("<b>Connecting…</b>")
+        head.pack_start(self.title, True, True, 0)
+        box.pack_start(head, False, False, 0)
+        self.rows = {}
+        for key, text in self.STEPS:
+            row = Gtk.Box(spacing=8)
+            ic = Gtk.Label(); tx = Gtk.Label(label=text, xalign=0)
+            row.pack_start(ic, False, False, 0); row.pack_start(tx, True, True, 0)
+            box.pack_start(row, False, False, 0)
+            self.rows[key] = (ic, tx, text)
+            self._mark(key, "pending")
+        self.detail = Gtk.Label(xalign=0); self.detail.set_line_wrap(True)
+        self.detail.get_style_context().add_class("dim-label")
+        box.pack_start(self.detail, False, False, 0)
+        self.btn = Gtk.Button(label="Close")
+        self.btn.connect("clicked", lambda *_: self.destroy())
+        self.btn.set_no_show_all(True)
+        box.pack_start(self.btn, False, False, 0)
+        self.add(box); self.show_all()
+
+    def _mark(self, key, state, note=None):
+        ic, tx, text = self.rows[key]
+        ch, col = self.MARK[state]
+        ic.set_markup('<span foreground="%s" weight="bold">%s</span>' % (col, ch))
+        label = text + ("  —  " + note if note else "")
+        if state == "fail":
+            tx.set_markup('<span foreground="%s">%s</span>' % (col, GLib.markup_escape_text(label)))
+        else:
+            tx.set_text(label)
+
+    def set_step(self, key, state, note=None):
+        self._mark(key, state, note); return False
+
+    def finish_ok(self):
+        self.spinner.stop()
+        self.title.set_markup('<b><span foreground="#1a8a1a">Connected ✓</span></b>')
+        self.app._connect_finished(True)
+        GLib.timeout_add_seconds(2, lambda: (self.destroy(), False)[1])
+        return False
+
+    def finish_fail(self, key, reason):
+        self.spinner.stop()
+        self.title.set_markup('<b><span foreground="#c0271a">Connection failed</span></b>')
+        self._mark(key, "fail")
+        self.detail.set_markup('<span foreground="#c0271a">%s</span>' % GLib.markup_escape_text(reason))
+        self.btn.show()
+        self.app._connect_finished(False)
+        return False
+
+
 class FortGnome:
     def __init__(self):
         self.busy = False; self.win = None
@@ -209,16 +282,87 @@ class FortGnome:
         if self.busy: return
         if not have_config():
             self.open_settings(); return
-        going_up = not vpn_is_up()
+        if vpn_is_up(): self._disconnect()
+        else:           self._connect()
+
+    def _connect(self):
+        self.busy = True
+        self.ind.set_icon_full("fortgnome-wait", "FortGNOME VPN connecting")
+        self.mi_status.set_label("Connecting…")
+        if self.win: self.win.update(True, True)
+        prog = ProgressWindow(self)
+        threading.Thread(target=self._connect_worker, args=(prog,), daemon=True).start()
+
+    def _disconnect(self):
         self.busy = True
         self.ind.set_icon_full("fortgnome-wait", "FortGNOME VPN working")
-        self.mi_status.set_label("Connecting…" if going_up else "Disconnecting…")
-        if self.win: self.win.update(going_up, True)
-        subprocess.Popen([HELPER, "up" if going_up else "down"])
-        GLib.timeout_add_seconds(4, self._finish)
+        self.mi_status.set_label("Disconnecting…")
+        if self.win: self.win.update(False, True)
+        def w():
+            subprocess.run([HELPER, "down"], capture_output=True)
+            GLib.idle_add(self._connect_finished, False)
+        threading.Thread(target=w, daemon=True).start()
 
-    def _finish(self):
+    def _connect_finished(self, success):
         self.busy = False; self.refresh(); return False
+
+    def _connect_worker(self, prog):
+        # make sure the daemon is up first
+        if subprocess.run(["pgrep", "-x", "charon"], capture_output=True).returncode != 0:
+            subprocess.run(["sudo", "-n", "ipsec", "start"], capture_output=True)
+            for _ in range(20):
+                if subprocess.run(["sudo", "-n", "ipsec", "status"], capture_output=True).returncode == 0:
+                    break
+                time.sleep(0.3)
+        GLib.idle_add(prog.set_step, "contact", "active")
+        done, fail = set(), None
+        try:
+            proc = subprocess.Popen(["sudo", "-n", "ipsec", "up", "fortgnome"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1)
+        except Exception as e:
+            GLib.idle_add(prog.finish_fail, "contact", str(e)); return
+        for line in proc.stdout:
+            l = line.strip()
+            if "IKE_SA" in l and "established between" in l and "contact" not in done:
+                done.add("contact")
+                GLib.idle_add(prog.set_step, "contact", "done")
+                GLib.idle_add(prog.set_step, "auth", "active")
+            elif "XAuth authentication" in l and "successful" in l and "auth" not in done:
+                done.add("auth")
+                GLib.idle_add(prog.set_step, "auth", "done")
+                GLib.idle_add(prog.set_step, "netcfg", "active")
+            elif "installing new virtual IP" in l and "netcfg" not in done:
+                done.add("netcfg")
+                GLib.idle_add(prog.set_step, "netcfg", "done", l.split()[-1])
+                GLib.idle_add(prog.set_step, "tunnel", "active")
+            elif ("established successfully" in l or ("CHILD_SA" in l and "established with" in l)) and "tunnel" not in done:
+                done.add("tunnel")
+                GLib.idle_add(prog.set_step, "tunnel", "done")
+            if "giving up after" in l and not fail:
+                fail = ("contact", "No reply from the VPN gateway. Check your internet "
+                        "connection and server address, and that this network allows VPN "
+                        "(UDP ports 500/4500 — some Wi-Fi/hotspots block them).")
+            elif "NO_PROPOSAL_CHOSEN" in l and not fail:
+                fail = ("tunnel" if ("auth" in done or "netcfg" in done) else "contact",
+                        "The gateway rejected the connection settings (encryption or "
+                        "destination network). Check the destination CIDR in Settings.")
+        proc.wait(); time.sleep(0.5)
+        up = subprocess.run(["ip", "route", "show", "table", "220"],
+                            capture_output=True, text=True).stdout.strip() != ""
+        if up and "tunnel" in done:
+            GLib.idle_add(prog.finish_ok)
+        else:
+            if not fail:
+                if "contact" not in done:
+                    fail = ("contact", "Couldn't reach the VPN gateway — check your network and the server address.")
+                elif "auth" not in done:
+                    fail = ("auth", "Login rejected — check your username and password.")
+                elif "netcfg" not in done:
+                    fail = ("netcfg", "The gateway didn't assign a network configuration.")
+                else:
+                    fail = ("tunnel", "Couldn't establish the encrypted tunnel.")
+            GLib.idle_add(prog.finish_fail, fail[0], fail[1])
 
     def open_settings(self):
         SettingsDialog(self.win, on_saved=self.refresh)  # shows itself; response-driven
