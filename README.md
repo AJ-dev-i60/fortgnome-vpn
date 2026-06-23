@@ -12,8 +12,9 @@ not affiliated with or endorsed by Fortinet; the shield icon is original art.
 ## Install (Debian/Ubuntu)
 
 ### Option A — double-click package
-Download `dist/fortgnome-vpn_1.0_all.deb`, double-click it (opens in your
-software installer) **or**:
+Download the latest `.deb` from the
+[**Releases**](https://github.com/AJ-dev-i60/fortgnome-vpn/releases) page,
+double-click it (opens in your software installer) **or**:
 
 ```bash
 sudo apt install ./fortgnome-vpn_1.0_all.deb

@@ -1,3 +1,6 @@
 # never commit per-user secrets
 config.ini
 *.swp
+
+# built packages are attached to GitHub Releases, not committed
+dist/*.deb
