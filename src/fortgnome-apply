@@ -1,0 +1,72 @@
+#!/bin/bash
+# fortgnome-apply — generate strongSwan config for FortGNOME VPN from a user's
+# settings file, then (re)load the daemon. Must run as root (via sudo).
+# Usage: fortgnome-apply [config.ini]   (defaults to the invoking user's config)
+set -e
+
+CONF="${1:-}"
+if [ -z "$CONF" ]; then
+  U="${SUDO_USER:-$USER}"
+  H="$(getent passwd "$U" | cut -d: -f6)"
+  CONF="$H/.config/fortgnome/config.ini"
+fi
+[ -r "$CONF" ] || { echo "fortgnome-apply: config not found: $CONF" >&2; exit 1; }
+
+get(){ sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONF" | head -1; }
+SERVER="$(get server)"
+USERNAME="$(get username)"
+PASSWORD="$(get password)"
+PSK="$(get psk)"
+RSUBNET="$(get remote_subnet)"
+LSUBNET="$(get client_subnet)"; LSUBNET="${LSUBNET:-0.0.0.0/0}"
+
+for v in SERVER USERNAME PASSWORD PSK RSUBNET; do
+  [ -n "${!v}" ] || { echo "fortgnome-apply: missing required field: $v" >&2; exit 2; }
+done
+
+install -d -m 700 /etc/ipsec.d
+
+cat > /etc/ipsec.d/fortgnome.conf <<EOF
+# Managed by FortGNOME VPN — edits will be overwritten when you change Settings.
+conn fortgnome
+	keyexchange=ikev1
+	aggressive=no
+	left=%defaultroute
+	leftauth=psk
+	leftauth2=xauth
+	leftid=%any
+	xauth_identity=$USERNAME
+	leftsourceip=%config
+	leftsubnet=$LSUBNET
+	right=$SERVER
+	rightauth=psk
+	rightsubnet=$RSUBNET
+	rightid=%any
+	ike=aes256-sha256-modp2048
+	esp=aes256-sha256,aes128-sha256,aes256-sha1,aes128-sha1,3des-sha1!
+	dpdaction=clear
+	dpddelay=30s
+	keyingtries=1
+	auto=add
+EOF
+chmod 600 /etc/ipsec.d/fortgnome.conf
+
+umask 077
+cat > /etc/ipsec.d/fortgnome.secrets <<EOF
+# Managed by FortGNOME VPN.
+$SERVER : PSK "$PSK"
+$USERNAME : XAUTH "$PASSWORD"
+EOF
+chmod 600 /etc/ipsec.d/fortgnome.secrets
+
+touch /etc/ipsec.conf /etc/ipsec.secrets
+grep -qxF 'include /etc/ipsec.d/fortgnome.conf'    /etc/ipsec.conf    || echo 'include /etc/ipsec.d/fortgnome.conf'    >> /etc/ipsec.conf
+grep -qxF 'include /etc/ipsec.d/fortgnome.secrets' /etc/ipsec.secrets || echo 'include /etc/ipsec.d/fortgnome.secrets' >> /etc/ipsec.secrets
+
+if pgrep -x charon >/dev/null 2>&1; then
+  ipsec reload >/dev/null 2>&1 || true
+  ipsec rereadsecrets >/dev/null 2>&1 || true
+else
+  ipsec start >/dev/null 2>&1 || true
+fi
+echo "fortgnome-apply: configuration applied"

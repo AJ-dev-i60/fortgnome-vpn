@@ -1,0 +1,21 @@
+#!/bin/bash
+# fortgnome — control the FortGNOME VPN (strongSwan conn "fortgnome").
+notify(){ command -v notify-send >/dev/null && notify-send -i network-vpn "FortGNOME VPN" "$1"; echo "$1"; }
+ensure_daemon(){ pgrep -x charon >/dev/null 2>&1 || { sudo ipsec start >/dev/null 2>&1; for i in $(seq 1 25); do sudo ipsec status >/dev/null 2>&1 && break; sleep 0.3; done; }; }
+is_up(){ sudo ipsec status fortgnome 2>/dev/null | grep -q INSTALLED; }
+case "$1" in
+  up|start|connect)
+     ensure_daemon
+     sudo ipsec up fortgnome >/dev/null 2>&1
+     is_up && notify "Connected" || notify "Connect FAILED — check Settings/credentials";;
+  down|stop|disconnect)
+     sudo ipsec down fortgnome >/dev/null 2>&1; notify "Disconnected";;
+  toggle)
+     ensure_daemon
+     if is_up; then sudo ipsec down fortgnome >/dev/null 2>&1; notify "Disconnected";
+     else sudo ipsec up fortgnome >/dev/null 2>&1; is_up && notify "Connected" || notify "Connect FAILED — check Settings"; fi;;
+  status|"")
+     if is_up; then echo "FortGNOME VPN: UP"; else echo "FortGNOME VPN: down"; fi
+     sudo ipsec status fortgnome 2>/dev/null | grep -iE 'ESTABLISHED|INSTALLED|===';;
+  *) echo "usage: fortgnome {up|down|toggle|status}";;
+esac

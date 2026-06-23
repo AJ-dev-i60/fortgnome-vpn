@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=FortGNOME VPN
+Comment=Connect/disconnect the FortiGate IPsec VPN
+Exec=/usr/lib/fortgnome/fortgnome-gui.py
+Icon=/usr/lib/fortgnome/icons/fortgnome-app.png
+Terminal=false
+Categories=Network;
+Keywords=vpn;fortigate;forticlient;ipsec;fortgnome;

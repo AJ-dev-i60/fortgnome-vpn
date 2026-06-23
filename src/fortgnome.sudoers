@@ -1,0 +1,3 @@
+# Installed by FortGNOME VPN. Lets members of the 'sudo' group control the VPN
+# (start/stop the tunnel and apply settings) without a password prompt.
+%sudo ALL=(root) NOPASSWD: /usr/sbin/ipsec, /usr/bin/fortgnome-apply
