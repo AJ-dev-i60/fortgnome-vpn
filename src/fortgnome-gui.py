@@ -6,7 +6,7 @@ per-user in ~/.config/fortgnome/config.ini and applied to strongSwan via the
 privileged helper `fortgnome-apply` (run through sudo). First run with no config
 opens the Settings dialog automatically.
 """
-import os, sys, signal, configparser, subprocess, threading, time, gi
+import os, sys, re, signal, configparser, subprocess, threading, time, gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
 from gi.repository import Gtk, GLib, GdkPixbuf, AyatanaAppIndicator3 as AppIndicator
@@ -73,6 +73,41 @@ def vpn_is_up():
         return bool(out.strip())
     except Exception:
         return False
+
+def assigned_ip():
+    """The virtual IP the gateway gave us (the 'src' in strongSwan's route table)."""
+    try:
+        out = subprocess.run(["ip", "route", "show", "table", "220"],
+                             capture_output=True, text=True, timeout=4).stdout
+        m = re.search(r"src (\d+\.\d+\.\d+\.\d+)", out)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+def traffic_bytes():
+    """(received, sent) bytes for this session's tunnel, or None."""
+    try:
+        out = subprocess.run(["sudo", "-n", "ipsec", "statusall", "fortgnome"],
+                             capture_output=True, text=True, timeout=5).stdout
+        rx = sum(int(x) for x in re.findall(r"(\d+) bytes_i", out))
+        tx = sum(int(x) for x in re.findall(r"(\d+) bytes_o", out))
+        return rx, tx
+    except Exception:
+        return None
+
+def human_bytes(n):
+    n = float(n)
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return "%d %s" % (int(n), u) if u == "B" else "%.1f %s" % (n, u)
+        n /= 1024
+    return "%.1f TB" % n
+
+def human_time(secs):
+    secs = int(secs); h, rem = divmod(secs, 3600); m, s = divmod(rem, 60)
+    if h: return "%dh %02dm %02ds" % (h, m, s)
+    if m: return "%dm %02ds" % (m, s)
+    return "%ds" % s
 
 
 class SettingsDialog(Gtk.Dialog):
@@ -153,6 +188,10 @@ class StatusWindow(Gtk.Window):
         self.spinner.set_no_show_all(True)
         box.pack_start(self.spinner, False, False, 0)
         self.lbl = Gtk.Label(); box.pack_start(self.lbl, False, False, 0)
+        self.info = Gtk.Label(); self.info.set_justify(Gtk.Justification.CENTER)
+        box.pack_start(self.info, False, False, 0)
+        self.stats = Gtk.Label(); self.stats.set_justify(Gtk.Justification.CENTER)
+        box.pack_start(self.stats, False, False, 0)
         self.btn = Gtk.Button(); self.btn.set_size_request(-1, 44)
         self.btn.connect("clicked", self.app.on_toggle)
         box.pack_start(self.btn, False, False, 0)
@@ -164,7 +203,7 @@ class StatusWindow(Gtk.Window):
         box.pack_start(setb, False, False, 0)
         self.add(box)
 
-    def render(self, icon, status, btn_label, btn_sensitive, err):
+    def render(self, icon, status, btn_label, btn_sensitive, err, info=""):
         self.img.set_from_pixbuf(GdkPixbuf.Pixbuf.new_from_file_at_size(
             os.path.join(ICONS, icon + ".png"), 96, 96))
         if status == "Connecting…":
@@ -174,9 +213,15 @@ class StatusWindow(Gtk.Window):
         col = self._COL.get(status, "#888888")
         self.lbl.set_markup('<b><span foreground="%s">%s</span></b>'
                             % (col, GLib.markup_escape_text(status)))
+        self.info.set_markup(info or "")
+        if status != "Connected":
+            self.stats.set_markup("")     # cleared here; filled live while connected
         self.btn.set_label(btn_label); self.btn.set_sensitive(btn_sensitive)
         self.err.set_markup(('<span foreground="#c0271a"><small>%s</small></span>'
                              % GLib.markup_escape_text(err)) if err else "")
+
+    def set_stats(self, markup):
+        self.stats.set_markup(markup or "")
 
 
 class FortGnome:
@@ -194,6 +239,7 @@ class FortGnome:
         self._cancelled = False
         self._abort = None     # 'cancel' | 'timeout' | None
         self._timeout_id = None
+        self._connected_at = None   # session start time (for the uptime timer)
         self.ind = AppIndicator.Indicator.new_with_path(
             APP_ID, "fortgnome-off", AppIndicator.IndicatorCategory.SYSTEM_SERVICES, ICONS)
         self.ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
@@ -212,12 +258,14 @@ class FortGnome:
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self._on_signal)
         self._apply()
         GLib.timeout_add_seconds(5, self._tick)
+        GLib.timeout_add_seconds(1, self._stats_tick)   # live IP/traffic/timer
         if not have_config():
             GLib.timeout_add(400, lambda: (self.open_settings(), False)[1])
 
     # ---- one place that renders state into both the tray menu and the window ----
     def _apply(self):
         up = (not self.busy) and vpn_is_up()
+        info = ""
         if self.busy and self.mode == "connecting":
             status, icon = "Connecting…", "fortgnome-wait"
             btn, sens = (self.progress or "Connecting…"), True   # click cancels
@@ -226,20 +274,41 @@ class FortGnome:
             btn, sens = "Disconnecting…", False
         elif up:
             self.failed = None
+            if self._connected_at is None: self._connected_at = time.time()
             status, icon = "Connected", "fortgnome-on"
             btn, sens = "Disconnect", True
+            vip = assigned_ip(); sub = load_config().get("remote_subnet", "")
+            bits = []
+            if vip: bits.append('<small>IP address: <b>%s</b></small>' % GLib.markup_escape_text(vip))
+            if sub: bits.append('<small><span foreground="#888888">%s reachable</span></small>'
+                                % GLib.markup_escape_text(sub))
+            info = "\n".join(bits)
         else:
+            self._connected_at = None
             status, icon = "Disconnected", "fortgnome-off"
             btn, sens = "Connect", True
         err = self.failed if (not self.busy and not up and self.failed) else ""
         self.ind.set_icon_full(icon, status)
         self.mi_status.set_label(status)
         self.mi_toggle.set_label(btn); self.mi_toggle.set_sensitive(sens)
-        if self.win: self.win.render(icon, status, btn, sens, err)
+        if self.win: self.win.render(icon, status, btn, sens, err, info)
 
     def refresh(self): self._apply()
     def _tick(self):
         if not self.busy: self._apply()
+        return True
+
+    def _stats_tick(self):
+        # while connected and the window is open, refresh traffic + uptime each second
+        if self.win and self.win.get_visible() and self._connected_at and not self.busy:
+            up = human_time(time.time() - self._connected_at)
+            tb = traffic_bytes()
+            if tb:
+                stats = ('<small>↓ %s    ↑ %s</small>\n<small>⏱ %s</small>'
+                         % (human_bytes(tb[0]), human_bytes(tb[1]), up))
+            else:
+                stats = '<small>⏱ %s</small>' % up
+            self.win.set_stats(stats)
         return True
 
     def _set_progress(self, text):
@@ -295,7 +364,7 @@ class FortGnome:
     def _connect(self):
         self.busy = True; self.mode = "connecting"
         self.failed = None; self._cancelled = False; self._abort = None; self._proc = None
-        self._shown = 0; self._vip = ""
+        self._shown = 0; self._vip = ""; self._connected_at = None
         self.progress = self._stepline(0)
         self._timeout_id = GLib.timeout_add_seconds(CONNECT_TIMEOUT, self._on_timeout)
         self._apply()
@@ -323,7 +392,7 @@ class FortGnome:
             except Exception: pass
 
     def _connect_worker(self):
-        DWELL = 0.45   # UI-only: minimum time each step is shown so they don't blur past
+        DWELL = 0.40   # UI-only: minimum time each step is shown so they don't blur past
         done, fail = set(), None
 
         def advance_to(target):
