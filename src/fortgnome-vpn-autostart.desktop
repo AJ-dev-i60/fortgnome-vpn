@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=FortGNOME VPN indicator
-Exec=/usr/lib/fortgnome/fortgnome-gui.py
+Exec=/usr/lib/fortgnome/fortgnome-gui.py --tray
 Icon=/usr/lib/fortgnome/icons/fortgnome-app.png
 Terminal=false
 X-GNOME-Autostart-enabled=true

@@ -6,7 +6,7 @@ per-user in ~/.config/fortgnome/config.ini and applied to strongSwan via the
 privileged helper `fortgnome-apply` (run through sudo). First run with no config
 opens the Settings dialog automatically.
 """
-import os, configparser, subprocess, threading, time, gi
+import os, sys, signal, configparser, subprocess, threading, time, gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
 from gi.repository import Gtk, GLib, GdkPixbuf, AyatanaAppIndicator3 as AppIndicator
@@ -20,6 +20,8 @@ CFG      = os.path.join(CFG_DIR, "config.ini")
 HELPER   = "/usr/bin/fortgnome"
 APPLY    = "/usr/bin/fortgnome-apply"
 APP_ID   = "fortgnome-vpn"
+PIDFILE  = os.path.join(GLib.get_user_runtime_dir() or "/tmp", "fortgnome-gui.pid")
+CONNECT_TIMEOUT = 30   # seconds before a connection attempt is abandoned with a timeout
 
 FIELDS = [  # key, label, is_secret
     ("server",        "VPN server (gateway IP/host)", False),
@@ -147,6 +149,9 @@ class StatusWindow(Gtk.Window):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         for m in ("top", "bottom", "start", "end"): getattr(box, "set_margin_"+m)(18)
         self.img = Gtk.Image(); box.pack_start(self.img, False, False, 0)
+        self.spinner = Gtk.Spinner(); self.spinner.set_size_request(28, 28)
+        self.spinner.set_no_show_all(True)
+        box.pack_start(self.spinner, False, False, 0)
         self.lbl = Gtk.Label(); box.pack_start(self.lbl, False, False, 0)
         self.btn = Gtk.Button(); self.btn.set_size_request(-1, 44)
         self.btn.connect("clicked", self.app.on_toggle)
@@ -162,6 +167,10 @@ class StatusWindow(Gtk.Window):
     def render(self, icon, status, btn_label, btn_sensitive, err):
         self.img.set_from_pixbuf(GdkPixbuf.Pixbuf.new_from_file_at_size(
             os.path.join(ICONS, icon + ".png"), 96, 96))
+        if status == "Connecting…":
+            self.spinner.show(); self.spinner.start()
+        else:
+            self.spinner.stop(); self.spinner.hide()
         col = self._COL.get(status, "#888888")
         self.lbl.set_markup('<b><span foreground="%s">%s</span></b>'
                             % (col, GLib.markup_escape_text(status)))
@@ -183,6 +192,8 @@ class FortGnome:
         self.failed = None     # last failure reason (small red sub-line)
         self._proc = None      # the running 'ipsec up' process (for cancel)
         self._cancelled = False
+        self._abort = None     # 'cancel' | 'timeout' | None
+        self._timeout_id = None
         self.ind = AppIndicator.Indicator.new_with_path(
             APP_ID, "fortgnome-off", AppIndicator.IndicatorCategory.SYSTEM_SERVICES, ICONS)
         self.ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
@@ -192,11 +203,13 @@ class FortGnome:
         self.mi_toggle = Gtk.MenuItem(label="Connect"); self.mi_toggle.connect("activate", self.on_toggle)
         mi_win = Gtk.MenuItem(label="Open window…");   mi_win.connect("activate", lambda *_: self.show_window())
         mi_set = Gtk.MenuItem(label="Settings…");      mi_set.connect("activate", lambda *_: self.open_settings())
-        mi_quit = Gtk.MenuItem(label="Quit indicator"); mi_quit.connect("activate", lambda *_: Gtk.main_quit())
+        mi_quit = Gtk.MenuItem(label="Quit FortGNOME"); mi_quit.connect("activate", self._quit)
         for w in (self.mi_status, Gtk.SeparatorMenuItem(), self.mi_toggle, mi_win, mi_set,
                   Gtk.SeparatorMenuItem(), mi_quit):
             m.append(w)
         m.show_all(); self.ind.set_menu(m)
+        # let a second launch (or `kill -USR1`) raise our window
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self._on_signal)
         self._apply()
         GLib.timeout_add_seconds(5, self._tick)
         if not have_config():
@@ -233,17 +246,46 @@ class FortGnome:
         self.progress = text; self._apply(); return False
 
     def _result(self, ok, msg):
-        self.busy = False; self.mode = None; self.progress = None; self._proc = None
+        if self._timeout_id:
+            GLib.source_remove(self._timeout_id); self._timeout_id = None
+        self.busy = False; self.mode = None; self.progress = None
+        self._proc = None; self._cancelled = False; self._abort = None
         self.failed = None if (ok or msg is None) else msg
         self._apply(); return False
 
     def _stepline(self, i, extra=""):
         return "%s… (%d/%d)%s" % (self.STEPS[i], i + 1, len(self.STEPS), extra)
 
+    def _on_signal(self):
+        self.show_window(); return True       # a 2nd launch / kill -USR1 raises the window
+
+    def _on_timeout(self):
+        self._timeout_id = None
+        if self.busy and self.mode == "connecting" and not self._abort:
+            self._abort_attempt("timeout")
+        return False
+
+    def _quit(self, *_):
+        if vpn_is_up():
+            d = Gtk.MessageDialog(transient_for=self.win, modal=True,
+                                  message_type=Gtk.MessageType.WARNING,
+                                  buttons=Gtk.ButtonsType.OK_CANCEL,
+                                  text="Quit FortGNOME VPN?")
+            d.format_secondary_text("The VPN is currently connected. Quitting will disconnect it.")
+            d.set_default_response(Gtk.ResponseType.CANCEL)
+            resp = d.run(); d.destroy()
+            if resp != Gtk.ResponseType.OK:
+                return
+            subprocess.run([HELPER, "down"], capture_output=True)
+        try:
+            if os.path.exists(PIDFILE): os.remove(PIDFILE)
+        except Exception: pass
+        Gtk.main_quit()
+
     def on_toggle(self, *_):
         if self.busy:
-            if self.mode == "connecting":
-                self._cancel()      # clicking while connecting abandons the attempt
+            if self.mode == "connecting" and not self._abort:
+                self._abort_attempt("cancel")   # click while connecting = abandon
             return
         if not have_config():
             self.open_settings(); return
@@ -252,8 +294,9 @@ class FortGnome:
 
     def _connect(self):
         self.busy = True; self.mode = "connecting"
-        self.failed = None; self._cancelled = False; self._proc = None
+        self.failed = None; self._cancelled = False; self._abort = None; self._proc = None
         self.progress = self._stepline(0)
+        self._timeout_id = GLib.timeout_add_seconds(CONNECT_TIMEOUT, self._on_timeout)
         self._apply()
         threading.Thread(target=self._connect_worker, daemon=True).start()
 
@@ -265,9 +308,9 @@ class FortGnome:
             GLib.idle_add(self._result, False, None)
         threading.Thread(target=w, daemon=True).start()
 
-    def _cancel(self):
-        self._cancelled = True
-        self.progress = "Cancelling…"
+    def _abort_attempt(self, kind):
+        self._abort = kind; self._cancelled = True
+        self.progress = "Cancelling…" if kind == "cancel" else "Timing out…"
         self._apply()
         # tell the daemon to abort the negotiation, and stop the 'ipsec up' client
         threading.Thread(target=lambda: subprocess.run(
@@ -279,45 +322,49 @@ class FortGnome:
             except Exception: pass
 
     def _connect_worker(self):
+        done, fail = set(), None
         # make sure the daemon is up first
         if subprocess.run(["pgrep", "-x", "charon"], capture_output=True).returncode != 0:
             subprocess.run(["sudo", "-n", "ipsec", "start"], capture_output=True)
             for _ in range(20):
+                if self._cancelled: break
                 if subprocess.run(["sudo", "-n", "ipsec", "status"], capture_output=True).returncode == 0:
                     break
                 time.sleep(0.3)
-        if self._cancelled:
-            GLib.idle_add(self._result, False, None); return
-        GLib.idle_add(self._set_progress, self._stepline(1))   # contacting gateway
-        done, fail = set(), None
-        try:
-            proc = subprocess.Popen(["sudo", "-n", "ipsec", "up", "fortgnome"],
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, bufsize=1)
-            self._proc = proc
-        except Exception as e:
-            GLib.idle_add(self._result, False, str(e)); return
-        for line in proc.stdout:
-            if self._cancelled:
-                break
-            l = line.strip()
-            if "IKE_SA" in l and "established between" in l and "contact" not in done:
-                done.add("contact"); GLib.idle_add(self._set_progress, self._stepline(2))
-            elif "XAuth authentication" in l and "successful" in l and "auth" not in done:
-                done.add("auth"); GLib.idle_add(self._set_progress, self._stepline(3))
-            elif "installing new virtual IP" in l and "netcfg" not in done:
-                done.add("netcfg"); GLib.idle_add(self._set_progress, self._stepline(4, "  " + l.split()[-1]))
-            elif ("established successfully" in l or ("CHILD_SA" in l and "established with" in l)) and "tunnel" not in done:
-                done.add("tunnel")
-            if "giving up after" in l and not fail:
-                fail = ("No reply from the VPN gateway. Check your internet connection "
-                        "and server address, and that this network allows VPN "
-                        "(UDP 500/4500 — some Wi-Fi/hotspots block them).")
-            elif "NO_PROPOSAL_CHOSEN" in l and not fail:
-                fail = ("The gateway rejected the connection settings (encryption or "
-                        "destination network). Check the destination CIDR in Settings.")
-        proc.wait(); time.sleep(0.4)
-        if self._cancelled:
+        if not self._cancelled:
+            GLib.idle_add(self._set_progress, self._stepline(1))   # contacting gateway
+            try:
+                proc = subprocess.Popen(["sudo", "-n", "ipsec", "up", "fortgnome"],
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        text=True, bufsize=1)
+                self._proc = proc
+                for line in proc.stdout:
+                    if self._cancelled:
+                        break
+                    l = line.strip()
+                    if "IKE_SA" in l and "established between" in l and "contact" not in done:
+                        done.add("contact"); GLib.idle_add(self._set_progress, self._stepline(2))
+                    elif "XAuth authentication" in l and "successful" in l and "auth" not in done:
+                        done.add("auth"); GLib.idle_add(self._set_progress, self._stepline(3))
+                    elif "installing new virtual IP" in l and "netcfg" not in done:
+                        done.add("netcfg"); GLib.idle_add(self._set_progress, self._stepline(4, "  " + l.split()[-1]))
+                    elif ("established successfully" in l or ("CHILD_SA" in l and "established with" in l)) and "tunnel" not in done:
+                        done.add("tunnel")
+                    if "giving up after" in l and not fail:
+                        fail = ("No reply from the VPN gateway. Check your internet connection "
+                                "and server address, and that this network allows VPN "
+                                "(UDP 500/4500 — some Wi-Fi/hotspots block them).")
+                    elif "NO_PROPOSAL_CHOSEN" in l and not fail:
+                        fail = ("The gateway rejected the connection settings (encryption or "
+                                "destination network). Check the destination CIDR in Settings.")
+                proc.wait(); time.sleep(0.4)
+            except Exception as e:
+                GLib.idle_add(self._result, False, str(e)); return
+        # ---- decide the outcome ----
+        if self._abort == "timeout":
+            GLib.idle_add(self._result, False,
+                          "Connection timed out — the VPN gateway didn't respond in time."); return
+        if self._abort == "cancel":
             GLib.idle_add(self._result, False, None); return
         up = subprocess.run(["ip", "route", "show", "table", "220"],
                             capture_output=True, text=True).stdout.strip() != ""
@@ -341,9 +388,33 @@ class FortGnome:
     def show_window(self):
         if self.win is None:
             self.win = StatusWindow(self)
-        self.win.show_all(); self.win.present()
+        self.win.show_all(); self.win.deiconify(); self.win.present()
         self._apply()
 
 
+def _running_instance():
+    try:
+        with open(PIDFILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)            # raises if that process is gone
+        return pid
+    except Exception:
+        return None
+
+
 if __name__ == "__main__":
-    FortGnome(); Gtk.main()
+    other = _running_instance()
+    if other:
+        # already running: ask that instance to open its window, then exit
+        try: os.kill(other, signal.SIGUSR1)
+        except Exception: pass
+        sys.exit(0)
+    try:
+        with open(PIDFILE, "w") as f: f.write(str(os.getpid()))
+    except Exception: pass
+    import atexit
+    atexit.register(lambda: os.path.exists(PIDFILE) and os.remove(PIDFILE))
+    app = FortGnome()
+    if "--tray" not in sys.argv:      # launched by the user → open the window
+        app.show_window()
+    Gtk.main()
