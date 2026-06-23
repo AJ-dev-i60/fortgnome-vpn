@@ -23,7 +23,7 @@ sudo apt install ./fortgnome-vpn_1.0_all.deb
 
 ### Option B — from this repo
 ```bash
-git clone <repo-url> && cd fortgnome-vpn
+git clone https://github.com/AJ-dev-i60/fortgnome-vpn.git && cd fortgnome-vpn
 sudo ./install.sh
 ```
 
