@@ -6,7 +6,7 @@ per-user in ~/.config/fortgnome/config.ini and applied to strongSwan via the
 privileged helper `fortgnome-apply` (run through sudo). First run with no config
 opens the Settings dialog automatically.
 """
-import os, configparser, subprocess, gi
+import os, configparser, subprocess, threading, gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
 from gi.repository import Gtk, GLib, GdkPixbuf, AyatanaAppIndicator3 as AppIndicator
@@ -42,14 +42,27 @@ def load_config():
 def have_config():
     return os.path.exists(CFG)
 
-def save_config(values):
-    cp = configparser.ConfigParser(); cp["vpn"] = values
+def write_config(values):
+    # merge onto any existing file so advanced keys (e.g. client_subnet) survive
+    cp = configparser.ConfigParser(); cp.read(CFG)
+    if not cp.has_section("vpn"): cp.add_section("vpn")
+    for k, v in values.items():
+        cp.set("vpn", k, v)
     os.makedirs(CFG_DIR, exist_ok=True)
     with open(CFG, "w") as f:
         cp.write(f)
     os.chmod(CFG, 0o600)
-    r = subprocess.run(["sudo", "-n", APPLY], capture_output=True, text=True)
-    return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+def apply_config():
+    """Run the privileged apply. Returns (ok, message). Safe to call off the
+    main thread; has a timeout so a stuck daemon can't block forever."""
+    try:
+        r = subprocess.run(["sudo", "-n", APPLY], capture_output=True, text=True, timeout=90)
+        return r.returncode == 0, (r.stderr or r.stdout).strip()
+    except subprocess.TimeoutExpired:
+        return False, "apply timed out (is the VPN daemon stuck? try Disconnect first)"
+    except Exception as e:
+        return False, str(e)
 
 def vpn_is_up():
     try:
@@ -96,13 +109,27 @@ class SettingsDialog(Gtk.Dialog):
         if missing:
             self.msg.set_markup('<span foreground="red">Please fill: %s</span>' % ", ".join(missing))
             self.stop_emission_by_name("response"); return
-        ok, info = save_config(values)
+        # write the (fast) config file now, then apply in the background so the
+        # GUI never freezes while strongSwan reloads.
+        write_config(values)
+        self.stop_emission_by_name("response")          # keep dialog open until apply finishes
+        self.set_response_sensitive(Gtk.ResponseType.OK, False)
+        self.set_response_sensitive(Gtk.ResponseType.CANCEL, False)
+        self.msg.set_markup("<i>Applying…</i>")
+        def worker():
+            ok, info = apply_config()
+            GLib.idle_add(self._apply_done, ok, info)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_done(self, ok, info):
         if ok:
             self.destroy(); self.on_saved()
         else:
+            self.set_response_sensitive(Gtk.ResponseType.OK, True)
+            self.set_response_sensitive(Gtk.ResponseType.CANCEL, True)
             self.msg.set_markup('<span foreground="red">Apply failed: %s</span>'
                                 % GLib.markup_escape_text(info or "see terminal"))
-            self.stop_emission_by_name("response")
+        return False
 
 
 class StatusWindow(Gtk.Window):
